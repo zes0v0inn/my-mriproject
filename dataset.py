@@ -99,6 +99,7 @@ def parse_csv(csv_path: str) -> Dict[str, float]:
             if len(row) < 2:
                 continue
             subj_id = row[0].strip()
+            print(subj_id)
             try:
                 score = float(row[1].strip())
             except ValueError:
@@ -150,7 +151,10 @@ def get_brats_file_list(
     # ── 确定要加载哪些 subjects ───────────────────────────────
     if csv_path is not None:
         id_to_score = parse_csv(csv_path)
-        subject_ids = list(id_to_score.keys())
+        keys = list(id_to_score.keys())
+        subject_ids = ["BraTS2021_" + key for key in keys]
+        print(f"[Dataset] Loading {len(subject_ids)} subjects from CSV '{csv_path}'")
+        print(f"[Test] Sample subjects from CSV: {subject_ids[:5]} ...")
     else:
         # 扫描目录获取所有 subjects
         subject_dirs = sorted(glob.glob(os.path.join(data_root, "BraTS2021_*")))
