@@ -1,30 +1,35 @@
 """
 Model Module
 ============
-Defines segmentation models for BraTS2021.
+Defines segmentation models for BraTS2021 with optional auxiliary classification head.
 
-包含:
-  ┌─────────────────────────────────────────────────────────────┐
-  │  自定义模型 (手写实现)                                        │
-  │    - basic_unet : 从零实现的 3D UNet                          │
-  │                                                              │
-  │  MONAI 内置模型 (直接调用)                                     │
-  │    - monai_unet      : MONAI 的 UNet                         │
-  │    - attention_unet   : UNet with attention gates             │
-  │    - unetr            : Vision-Transformer encoder + CNN      │
-  │    - swin_unetr       : Swin-Transformer based UNet           │
-  └─────────────────────────────────────────────────────────────┘
+核心设计:
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                                                                     │
+  │  任何 backbone (手写 or MONAI)                                       │
+  │      │                                                              │
+  │      ├─→ seg_output   (B, 3, D, H, W)   分割结果                     │
+  │      │                                                              │
+  │      └─→ bottleneck features ──→ ClassificationHead ──→ cls_output  │
+  │              ↑                        (GAP → FC)         (B, 1)     │
+  │              │                                                      │
+  │         通过两种方式获取:                                              │
+  │           1. 手写模型: 直接从 encoder 拿                               │
+  │           2. MONAI 模型: 用 forward hook 截取                         │
+  │                                                                     │
+  └─────────────────────────────────────────────────────────────────────┘
 
-所有模型统一接口:
-  - Input:  (B, 4, D, H, W)   4通道 MRI
-  - Output: (B, 3, D, H, W)   3通道 分割 (TC, WT, ET)
+使用方式:
+  # 纯分割 (和之前一样)
+  model = build_model("basic_unet")
+  seg_out = model(x)                    # (B, 3, D, H, W)
 
-添加你自己的模型只需要两步:
-  1. 在本文件中定义你的 nn.Module 类
-  2. 在 build_model() 工厂函数中注册一个 elif 分支
+  # 分割 + 分类 (多任务)
+  model = build_model("basic_unet", with_classifier=True)
+  seg_out, cls_out = model(x)           # seg: (B, 3, D, H, W), cls: (B, 1)
 """
 
-from typing import Tuple
+from typing import Tuple, Optional, Dict
 
 import torch
 import torch.nn as nn
@@ -32,18 +37,11 @@ from monai.networks.nets import UNet, AttentionUnet, UNETR, SwinUNETR
 
 
 # ═════════════════════════════════════════════════════════════
-#  自定义模型: 手写 3D UNet
+#  Part 1: 基础构件 — 手写 3D UNet
 # ═════════════════════════════════════════════════════════════
 
 class ConvBlock(nn.Module):
-    """
-    基础卷积块: Conv3d → InstanceNorm → LeakyReLU → Conv3d → InstanceNorm → LeakyReLU
-
-    为什么用 InstanceNorm 而不是 BatchNorm?
-      - 医学图像 batch 通常很小 (1~2), InstanceNorm 在小 batch 下更稳定
-    为什么用 LeakyReLU?
-      - 避免 ReLU 的 "dead neuron" 问题
-    """
+    """Conv3d × 2 + InstanceNorm + LeakyReLU"""
     def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
         super().__init__()
         self.conv = nn.Sequential(
@@ -61,22 +59,7 @@ class ConvBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    """
-    UNet 编码器路径 (下采样)
-
-    每一层:  ConvBlock → MaxPool3d(2)
-    最后一层 (bottleneck) 不做 pool
-
-    Example with features=(32, 64, 128, 256):
-        输入 (B, 4, D, H, W)
-         ↓ ConvBlock → skip1 (B, 32, D, H, W)
-         ↓ MaxPool
-         ↓ ConvBlock → skip2 (B, 64, D/2, H/2, W/2)
-         ↓ MaxPool
-         ↓ ConvBlock → skip3 (B, 128, D/4, H/4, W/4)
-         ↓ MaxPool
-         ↓ ConvBlock → bottleneck (B, 256, D/8, H/8, W/8)
-    """
+    """UNet 编码器: ConvBlock + MaxPool, 最后一层不 pool (即 bottleneck)"""
     def __init__(self, in_ch: int, features: Tuple[int, ...], dropout: float = 0.0):
         super().__init__()
         self.stages = nn.ModuleList()
@@ -85,7 +68,7 @@ class Encoder(nn.Module):
         ch = in_ch
         for i, f in enumerate(features):
             self.stages.append(ConvBlock(ch, f, dropout=dropout))
-            if i < len(features) - 1:  # 最后一层不 pool
+            if i < len(features) - 1:
                 self.pools.append(nn.MaxPool3d(kernel_size=2, stride=2))
             ch = f
 
@@ -94,101 +77,46 @@ class Encoder(nn.Module):
         for i, stage in enumerate(self.stages):
             x = stage(x)
             if i < len(self.stages) - 1:
-                skips.append(x)        # 保存 skip connection
-                x = self.pools[i](x)   # 下采样
-        return x, skips  # x = bottleneck, skips = [skip1, skip2, ...]
+                skips.append(x)
+                x = self.pools[i](x)
+        return x, skips  # x = bottleneck
 
 
 class Decoder(nn.Module):
-    """
-    UNet 解码器路径 (上采样 + skip connection)
-
-    每一层:
-        1. ConvTranspose3d 上采样 2x
-        2. Concatenate skip connection
-        3. ConvBlock 融合特征
-
-    Example with features=(256, 128, 64, 32):
-        bottleneck (B, 256, D/8, H/8, W/8)
-         ↑ ConvTranspose → (B, 128, D/4, H/4, W/4)
-         ↑ Cat skip3     → (B, 256, D/4, H/4, W/4)
-         ↑ ConvBlock     → (B, 128, D/4, H/4, W/4)
-         ↑ ...
-         ↑ ConvBlock     → (B, 32, D, H, W)
-    """
+    """UNet 解码器: ConvTranspose + Concat skip + ConvBlock"""
     def __init__(self, features: Tuple[int, ...], dropout: float = 0.0):
         super().__init__()
         self.upconvs = nn.ModuleList()
         self.stages  = nn.ModuleList()
 
-        # features 从 bottleneck 到最浅层, 如 (256, 128, 64, 32)
-        # 解码时从 256 → 128 → 64 → 32
         for i in range(len(features) - 1):
             in_f  = features[i]
             out_f = features[i + 1]
-            self.upconvs.append(
-                nn.ConvTranspose3d(in_f, out_f, kernel_size=2, stride=2)
-            )
-            # cat 之后通道数 = out_f (上采样) + out_f (skip) = 2 * out_f
+            self.upconvs.append(nn.ConvTranspose3d(in_f, out_f, kernel_size=2, stride=2))
             self.stages.append(ConvBlock(out_f * 2, out_f, dropout=dropout))
 
     def forward(self, x, skips):
-        """
-        Args:
-            x: bottleneck feature map
-            skips: list of skip connections [skip1, skip2, ...] (浅→深)
-                   我们从最深的 skip 开始用, 所以 reverse
-        """
-        skips = skips[::-1]  # reverse: 从最深层的 skip 开始
-
+        skips = skips[::-1]
         for i, (upconv, stage) in enumerate(zip(self.upconvs, self.stages)):
             x = upconv(x)
-
-            # 处理尺寸不匹配 (因为 pool 时奇数尺寸会丢 1 pixel)
             skip = skips[i]
             if x.shape != skip.shape:
-                x = nn.functional.pad(x, self._calc_pad(x, skip))
-
-            x = torch.cat([x, skip], dim=1)  # 沿 channel 维度拼接
+                d = skip.shape[2] - x.shape[2]
+                h = skip.shape[3] - x.shape[3]
+                w = skip.shape[4] - x.shape[4]
+                x = nn.functional.pad(x, (0, w, 0, h, 0, d))
+            x = torch.cat([x, skip], dim=1)
             x = stage(x)
-
         return x
-
-    @staticmethod
-    def _calc_pad(x, target):
-        """计算让 x 和 target 空间维度对齐所需的 padding."""
-        d_diff = target.shape[2] - x.shape[2]
-        h_diff = target.shape[3] - x.shape[3]
-        w_diff = target.shape[4] - x.shape[4]
-        return (0, w_diff, 0, h_diff, 0, d_diff)
 
 
 class BasicUNet3D(nn.Module):
     """
-    从零手写的 3D UNet
+    手写 3D UNet, 支持返回 bottleneck 特征.
 
-    结构图:
-        Input (B, 4, D, H, W)
-          │
-          ├──► Encoder Level 1  ──────────────────────► skip1 ──┐
-          │        ↓ MaxPool                                     │
-          ├──► Encoder Level 2  ──────────────────► skip2 ──┐   │
-          │        ↓ MaxPool                                 │   │
-          ├──► Encoder Level 3  ──────────► skip3 ──┐       │   │
-          │        ↓ MaxPool                         │       │   │
-          └──► Bottleneck                            │       │   │
-                   ↓ ConvTranspose                   │       │   │
-               Cat(↑, skip3) → ConvBlock ◄───────────┘       │   │
-                   ↓ ConvTranspose                           │   │
-               Cat(↑, skip2) → ConvBlock ◄───────────────────┘   │
-                   ↓ ConvTranspose                               │
-               Cat(↑, skip1) → ConvBlock ◄───────────────────────┘
-                   ↓
-               1×1×1 Conv → Output (B, 3, D, H, W)
-
-    用法:
-        model = BasicUNet3D(in_channels=4, out_channels=3, features=(32, 64, 128, 256))
-        output = model(input)  # input: (B, 4, D, H, W) → output: (B, 3, D, H, W)
+    forward 返回:
+      - 默认:     seg_output  (B, 3, D, H, W)
+      - 需要特征: (seg_output, bottleneck)   bottleneck: (B, C_deep, d, h, w)
     """
     def __init__(
         self,
@@ -198,52 +126,319 @@ class BasicUNet3D(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
-
         self.encoder = Encoder(in_channels, features, dropout=dropout)
-        self.decoder = Decoder(features[::-1], dropout=dropout)  # reverse for decoding
-
-        # 最终 1x1x1 卷积: 将最浅层特征映射到输出类别数
+        self.decoder = Decoder(features[::-1], dropout=dropout)
         self.head = nn.Conv3d(features[0], out_channels, kernel_size=1)
 
+        # 记录 bottleneck 通道数, 方便外部构建分类头
+        self.bottleneck_channels = features[-1]
+
+        # 控制是否返回 bottleneck 特征
+        self._return_features = False
+
+    def set_return_features(self, flag: bool):
+        """开关: 是否让 forward 同时返回 bottleneck 特征"""
+        self._return_features = flag
+
     def forward(self, x):
-        # 编码
         bottleneck, skips = self.encoder(x)
-        # 解码
         out = self.decoder(bottleneck, skips)
-        # 输出 head (不加 sigmoid, 交给 loss 函数处理)
-        out = self.head(out)
-        return out
+        seg_out = self.head(out)
+
+        if self._return_features:
+            return seg_out, bottleneck
+        return seg_out
 
 
 # ═════════════════════════════════════════════════════════════
-#  你可以在这里继续添加自己的模型, 比如:
+#  Part 2: MONAI 模型特征提取 — Forward Hook 机制
 # ═════════════════════════════════════════════════════════════
 #
-# class MyResUNet3D(nn.Module):
-#     """带残差连接的 UNet — 只需把 ConvBlock 改成带 shortcut 的版本"""
-#     def __init__(self, in_channels, out_channels, features, dropout=0.0):
-#         super().__init__()
-#         # ... 你的实现 ...
+#  问题: MONAI 的模型是封装好的, 我们没法像手写模型那样
+#        直接拿 encoder 的 bottleneck 输出.
 #
-#     def forward(self, x):
-#         # ... 你的实现 ...
-#         return out
+#  解决: 用 PyTorch 的 register_forward_hook() 在指定层上
+#        "截取" 该层的输出. 这不需要修改 MONAI 的源码.
 #
+#  原理图:
 #
-# class MyUNetPlusPlus(nn.Module):
-#     """UNet++ (嵌套 UNet / Dense skip connections)"""
-#     def __init__(self, ...):
-#         super().__init__()
-#         # ... 你的实现 ...
+#    Input ──→ [ Layer_1 ] ──→ [ Layer_2 ] ──→ ... ──→ [ Bottleneck ] ──→ ... ──→ Output
+#                                                            │
+#                                                       hook 截取!
+#                                                            │
+#                                                            ↓
+#                                                     captured_features
 #
-#     def forward(self, x):
-#         # ... 你的实现 ...
-#         return out
+
+class FeatureHook:
+    """
+    一个简单的 forward hook, 用来捕获某一层的输出.
+
+    用法:
+        hook = FeatureHook()
+        model.some_layer.register_forward_hook(hook)
+        output = model(input)
+        bottleneck_features = hook.features  # 就是 some_layer 的输出
+    """
+    def __init__(self):
+        self.features: Optional[torch.Tensor] = None
+
+    def __call__(self, module, input, output):
+        # output 就是这一层的前向输出
+        # 有些层返回 tuple, 我们取第一个 tensor
+        if isinstance(output, tuple):
+            self.features = output[0]
+        else:
+            self.features = output
+
+    def clear(self):
+        self.features = None
+
+
+def find_bottleneck_layer(model: nn.Module, model_name: str) -> Tuple[nn.Module, int]:
+    """
+    根据模型类型, 找到 bottleneck 层并返回 (layer, channels).
+
+    这是整个 hook 机制中最关键的函数 — 你需要知道 MONAI 模型
+    内部的层名字. 可以通过 print(model) 查看完整结构.
+
+    ┌──────────────┬─────────────────────────┬────────────────────────┐
+    │  模型         │  bottleneck 层路径       │  怎么找到的             │
+    ├──────────────┼─────────────────────────┼────────────────────────┤
+    │  MONAI UNet  │  model.model[2]         │  print(model) 看结构   │
+    │              │  (最深的 down block)     │  encoder 部分的最后一块  │
+    │              │                         │                        │
+    │  AttnUnet    │  model.model[2]         │  同上, 结构类似          │
+    │              │                         │                        │
+    │  UNETR       │  model.encoder          │  ViT encoder 的输出     │
+    │              │  (ViT backbone)         │  768-dim feature       │
+    │              │                         │                        │
+    │  SwinUNETR   │  model.swinViT          │  Swin encoder 最后一层  │
+    │              │  (SwinTransformer)      │  768-dim feature       │
+    └──────────────┴─────────────────────────┴────────────────────────┘
+
+    如果你不确定某个模型的层名, 只需要:
+        model = build_backbone("monai_unet", ...)
+        print(model)      ← 打印完整结构
+        # 或者
+        for name, module in model.named_modules():
+            print(name, type(module))
+
+    Args:
+        model: MONAI 模型实例
+        model_name: 模型名字 (用于判断结构)
+
+    Returns:
+        (target_layer, bottleneck_channels)
+    """
+    name = model_name.lower().replace("-", "_")
+
+    if name == "monai_unet":
+        # MONAI UNet 结构: model.model = Sequential(down_1, down_2, ..., bottom, up_1, ...)
+        # 编码器的最深层是中间那个 block
+        # channels 的最后一个值就是 bottleneck 通道数
+        n_layers = len(model.model)
+        bottleneck_idx = n_layers // 2  # 中间层就是 bottleneck
+        layer = model.model[bottleneck_idx]
+        channels = model.channels[-1]  # features 的最后一个
+        return layer, channels
+
+    elif name == "attention_unet":
+        # AttentionUnet 结构类似, bottleneck 也在中间
+        n_layers = len(model.model)
+        bottleneck_idx = n_layers // 2
+        layer = model.model[bottleneck_idx]
+        channels = model.channels[-1]
+        return layer, channels
+
+    elif name == "unetr":
+        # UNETR: ViT encoder 输出 hidden_size (默认 768)
+        layer = model.encoder
+        channels = model.hidden_size  # 768
+        return layer, channels
+
+    elif name == "swin_unetr":
+        # SwinUNETR: SwinTransformer backbone
+        layer = model.swinViT
+        channels = 768  # SwinUNETR 最深层特征维度
+        return layer, channels
+
+    else:
+        raise ValueError(f"Don't know how to find bottleneck for '{model_name}'")
 
 
 # ═════════════════════════════════════════════════════════════
-#  工厂函数 — train.py 的唯一入口
+#  Part 3: 分类头 + 多任务包装器
 # ═════════════════════════════════════════════════════════════
+
+class ClassificationHead(nn.Module):
+    """
+    轻量分类头: Global Average Pooling → FC layers → 输出
+
+    结构:
+        bottleneck (B, C, d, h, w)
+            ↓ AdaptiveAvgPool3d(1)
+        (B, C, 1, 1, 1)
+            ↓ Flatten
+        (B, C)
+            ↓ FC → ReLU → Dropout → FC
+        (B, num_classes)
+
+    为什么用 GAP 而不是 Flatten?
+      - bottleneck 的空间尺寸不固定 (取决于输入大小和下采样次数)
+      - GAP 把任意空间尺寸压缩成 1×1×1, 输出维度只取决于通道数
+      - 参数量也小很多
+    """
+    def __init__(self, in_channels: int, num_classes: int = 1, dropout: float = 0.3):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),       # (B, C, d, h, w) → (B, C, 1, 1, 1)
+            nn.Flatten(),                   # (B, C)
+            nn.Linear(in_channels, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            nn.Linear(128, num_classes),    # (B, num_classes)
+        )
+
+    def forward(self, x):
+        return self.head(x)
+
+
+class SegWithClassifier(nn.Module):
+    """
+    多任务包装器: 分割 backbone + 分类头
+
+    这个 wrapper 可以包装 **任何** 分割模型 (手写的或 MONAI 的),
+    统一提供 (seg_output, cls_output) 的双输出接口.
+
+    工作原理:
+    ┌──────────────────────────────────────────────────────────┐
+    │                                                          │
+    │  对于手写模型 (BasicUNet3D):                               │
+    │    直接调用 model.set_return_features(True)                │
+    │    forward 时自动返回 (seg_out, bottleneck)                │
+    │                                                          │
+    │  对于 MONAI 模型:                                         │
+    │    在 bottleneck 层注册 forward hook                      │
+    │    forward 时正常跑, hook 偷偷截取 bottleneck 特征          │
+    │                                                          │
+    │  然后:                                                    │
+    │    bottleneck → ClassificationHead → cls_output           │
+    │                                                          │
+    └──────────────────────────────────────────────────────────┘
+
+    用法:
+        model = SegWithClassifier(backbone, backbone_name, num_classes=1)
+        seg_out, cls_out = model(x)
+        # seg_out: (B, 3, D, H, W)
+        # cls_out: (B, 1)
+    """
+    def __init__(
+        self,
+        backbone: nn.Module,
+        backbone_name: str,
+        num_classes: int = 1,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.backbone_name = backbone_name.lower().replace("-", "_")
+
+        # ── 根据 backbone 类型选择特征提取策略 ────────────────
+        if self.backbone_name == "basic_unet":
+            # 手写模型: 直接让它返回 features
+            self.backbone.set_return_features(True)
+            bottleneck_ch = self.backbone.bottleneck_channels
+            self._use_hook = False
+        else:
+            # MONAI 模型: 用 hook 截取
+            layer, bottleneck_ch = find_bottleneck_layer(backbone, backbone_name)
+            self._hook = FeatureHook()
+            self._hook_handle = layer.register_forward_hook(self._hook)
+            self._use_hook = True
+
+        # ── 分类头 ────────────────────────────────────────────
+        self.cls_head = ClassificationHead(
+            in_channels=bottleneck_ch,
+            num_classes=num_classes,
+            dropout=dropout,
+        )
+
+        print(f"[Model] Added ClassificationHead: {bottleneck_ch}ch → {num_classes} output")
+
+    def forward(self, x):
+        if not self._use_hook:
+            # BasicUNet3D: forward 直接返回 (seg, features)
+            seg_out, bottleneck = self.backbone(x)
+        else:
+            # MONAI 模型: 正常 forward, hook 自动截取
+            seg_out = self.backbone(x)
+            bottleneck = self._hook.features
+            assert bottleneck is not None, \
+                "Hook failed to capture features. Check find_bottleneck_layer()."
+
+        # 分类头
+        cls_out = self.cls_head(bottleneck)
+
+        return seg_out, cls_out
+
+    def remove_hooks(self):
+        """清理 hook (在 model 不再使用时调用, 避免内存泄漏)"""
+        if self._use_hook and hasattr(self, "_hook_handle"):
+            self._hook_handle.remove()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Part 4: 工厂函数
+# ═════════════════════════════════════════════════════════════
+
+def _build_backbone(
+    model_name: str,
+    in_channels: int = 4,
+    out_channels: int = 3,
+    roi_size: Tuple[int, int, int] = (128, 128, 128),
+    features: Tuple[int, ...] = (32, 64, 128, 256),
+    dropout: float = 0.1,
+) -> nn.Module:
+    """构建纯分割 backbone (不带分类头)"""
+    name = model_name.lower().replace("-", "_")
+
+    if name == "basic_unet":
+        return BasicUNet3D(in_channels, out_channels, features, dropout)
+
+    elif name == "monai_unet":
+        return UNet(
+            spatial_dims=3, in_channels=in_channels, out_channels=out_channels,
+            channels=features, strides=(2,) * (len(features) - 1),
+            num_res_units=2, dropout=dropout,
+        )
+
+    elif name == "attention_unet":
+        return AttentionUnet(
+            spatial_dims=3, in_channels=in_channels, out_channels=out_channels,
+            channels=features, strides=(2,) * (len(features) - 1), dropout=dropout,
+        )
+
+    elif name == "unetr":
+        return UNETR(
+            in_channels=in_channels, out_channels=out_channels, img_size=roi_size,
+            feature_size=16, hidden_size=768, mlp_dim=3072, num_heads=12,
+            proj_type="conv", norm_name="instance", res_block=True, dropout_rate=dropout,
+        )
+
+    elif name == "swin_unetr":
+        return SwinUNETR(
+            img_size=roi_size, in_channels=in_channels, out_channels=out_channels,
+            feature_size=48, drop_rate=dropout, attn_drop_rate=0.0,
+            dropout_path_rate=0.0, use_checkpoint=True,
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown model '{model_name}'. "
+            f"Available: basic_unet, monai_unet, attention_unet, unetr, swin_unetr"
+        )
+
 
 def build_model(
     model_name: str = "basic_unet",
@@ -252,134 +447,87 @@ def build_model(
     roi_size: Tuple[int, int, int] = (128, 128, 128),
     features: Tuple[int, ...] = (32, 64, 128, 256),
     dropout: float = 0.1,
+    # ── 分类头相关 (新增) ──────────────────────────────────
+    with_classifier: bool = False,
+    num_classes: int = 1,
+    cls_dropout: float = 0.3,
 ) -> nn.Module:
     """
-    工厂函数: 根据名字构建模型.
+    工厂函数 — train.py 的唯一入口.
 
     ┌──────────────────┬────────────────────────────────────┐
     │  model_name      │  来源                              │
     ├──────────────────┼────────────────────────────────────┤
-    │  basic_unet      │  ★ 手写实现 (本文件)               │
+    │  basic_unet      │  ★ 手写实现                        │
     │  monai_unet      │  MONAI UNet                       │
     │  attention_unet  │  MONAI AttentionUnet              │
     │  unetr           │  MONAI UNETR                      │
     │  swin_unetr      │  MONAI SwinUNETR                  │
     └──────────────────┴────────────────────────────────────┘
 
-    添加新模型只需:
-      1. 在上面写一个 class MyModel(nn.Module)
-      2. 在下面加一个 elif name == "my_model": model = MyModel(...)
-      3. 在 train.py 的 --model choices 列表里加上 "my_model"
-
     Args:
-        model_name: 模型名称
-        in_channels: 输入通道数 (BraTS = 4)
-        out_channels: 输出通道数 (3: TC, WT, ET)
-        roi_size: 输入 patch 尺寸 (Transformer 模型需要)
-        features: 各层通道数 (UNet 系列)
-        dropout: Dropout 概率
+        model_name: 模型架构名称
+        with_classifier: 是否附加分类头 (多任务学习)
+        num_classes: 分类头输出维度 (默认 1, 用于回归 score)
+        cls_dropout: 分类头的 dropout
+        (其余参数同之前)
 
     Returns:
-        nn.Module
+        with_classifier=False → model(x) returns seg_output
+        with_classifier=True  → model(x) returns (seg_output, cls_output)
     """
-    name = model_name.lower().replace("-", "_")
+    backbone = _build_backbone(
+        model_name, in_channels, out_channels, roi_size, features, dropout
+    )
 
-    # ── 自定义模型 ────────────────────────────────────────────
-    if name == "basic_unet":
-        model = BasicUNet3D(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            features=features,
-            dropout=dropout,
+    if with_classifier:
+        model = SegWithClassifier(
+            backbone=backbone,
+            backbone_name=model_name,
+            num_classes=num_classes,
+            dropout=cls_dropout,
         )
-
-    # ── MONAI 内置模型 ───────────────────────────────────────
-    elif name == "monai_unet":
-        model = UNet(
-            spatial_dims=3,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            channels=features,
-            strides=(2,) * (len(features) - 1),
-            num_res_units=2,
-            dropout=dropout,
-        )
-
-    elif name == "attention_unet":
-        model = AttentionUnet(
-            spatial_dims=3,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            channels=features,
-            strides=(2,) * (len(features) - 1),
-            dropout=dropout,
-        )
-
-    elif name == "unetr":
-        model = UNETR(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            img_size=roi_size,
-            feature_size=16,
-            hidden_size=768,
-            mlp_dim=3072,
-            num_heads=12,
-            proj_type="conv",
-            norm_name="instance",
-            res_block=True,
-            dropout_rate=dropout,
-        )
-
-    elif name == "swin_unetr":
-        model = SwinUNETR(
-            img_size=roi_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            feature_size=48,
-            drop_rate=dropout,
-            attn_drop_rate=0.0,
-            dropout_path_rate=0.0,
-            use_checkpoint=True,
-        )
-
-    # ── 你的新模型在这里注册 ──────────────────────────────────
-    #
-    # elif name == "my_resunet":
-    #     model = MyResUNet3D(in_channels, out_channels, features, dropout)
-    #
-    # elif name == "my_unet_plusplus":
-    #     model = MyUNetPlusPlus(in_channels, out_channels, ...)
-
     else:
-        raise ValueError(
-            f"Unknown model '{model_name}'. "
-            f"Available: basic_unet, monai_unet, attention_unet, unetr, swin_unetr"
-        )
+        model = backbone
 
     # 打印参数量
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[Model] {name}")
-    print(f"  Total params     : {total_params:,}")
-    print(f"  Trainable params : {trainable_params:,}")
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[Model] {model_name}" + (" + ClassificationHead" if with_classifier else ""))
+    print(f"  Total params     : {total:,}")
+    print(f"  Trainable params : {trainable:,}")
 
     return model
 
 
 # ═════════════════════════════════════════════════════════════
-#  Smoke test — 验证手写模型和 MONAI 模型输出一致
+#  Smoke test
 # ═════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    test_features = (16, 32, 64, 128)
+    x = torch.randn(1, 4, 64, 64, 64, device=device)
 
+    print("=" * 70)
+    print("  Test 1: 纯分割模式")
+    print("=" * 70)
     for name in ["basic_unet", "monai_unet"]:
-        print(f"\n{'='*60}")
-        model = build_model(name, features=(16, 32, 64, 128)).to(device)
-        x = torch.randn(1, 4, 64, 64, 64, device=device)
+        model = build_model(name, features=test_features, with_classifier=False).to(device)
         with torch.no_grad():
             y = model(x)
-        print(f"  Input  : {x.shape}")
-        print(f"  Output : {y.shape}")
-        assert y.shape == (1, 3, 64, 64, 64), f"Shape mismatch! Got {y.shape}"
-        print("  ✓ Pass")
+        print(f"  {name:16s}  Input: {x.shape}  →  Seg: {y.shape}")
+        assert y.shape == (1, 3, 64, 64, 64)
+        print(f"  {'':16s}  ✓ Pass\n")
+
+    print("=" * 70)
+    print("  Test 2: 分割 + 分类 多任务模式")
+    print("=" * 70)
+    for name in ["basic_unet", "monai_unet"]:
+        model = build_model(name, features=test_features, with_classifier=True, num_classes=1).to(device)
+        with torch.no_grad():
+            seg, cls = model(x)
+        print(f"  {name:16s}  Input: {x.shape}  →  Seg: {seg.shape}  Cls: {cls.shape}")
+        assert seg.shape == (1, 3, 64, 64, 64)
+        assert cls.shape == (1, 1)
+        print(f"  {'':16s}  ✓ Pass\n")
