@@ -62,10 +62,11 @@ def parse_args():
     data_group = parser.add_argument_group("Data")
     data_group.add_argument("--data_root", type=str, required=True,
                             help="Path to BraTS2021 dataset root directory")
-    data_group.add_argument("--csv_path", type=str, default=None,
-                            help="Path to CSV file (subject_id, score). "
-                                 "If provided, only subjects listed in CSV are used, "
-                                 "and score is included in each batch.")
+    data_group.add_argument("--train_csv", type=str, default=None,
+                            help="Path to training CSV (subject_id, score)")
+    data_group.add_argument("--val_csv", type=str, default=None,
+                            help="Path to validation CSV (subject_id, score). "
+                                 "If omitted, auto-split from train_csv or full directory.")
     data_group.add_argument("--max_samples", type=int, default=None,
                             help="Limit number of samples (for debugging)")
     data_group.add_argument("--val_ratio", type=float, default=0.2,
@@ -351,7 +352,8 @@ def main():
 
     train_loader, val_loader = get_dataloaders(
         data_root=args.data_root,
-        csv_path=args.csv_path,
+        train_csv=args.train_csv,
+        val_csv=args.val_csv,
         batch_size=args.batch_size,
         val_ratio=args.val_ratio,
         num_workers=args.num_workers,

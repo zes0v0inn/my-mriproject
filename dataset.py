@@ -287,7 +287,8 @@ def get_val_transforms() -> Compose:
 
 def get_dataloaders(
     data_root: str,
-    csv_path: Optional[str] = None,
+    train_csv: Optional[str] = None,
+    val_csv: Optional[str] = None,
     batch_size: int = 2,
     val_ratio: float = 0.2,
     num_workers: int = 4,
@@ -297,35 +298,41 @@ def get_dataloaders(
     seed: int = 42,
 ) -> Tuple[DataLoader, DataLoader]:
     """
-    End-to-end helper: scan data, split, build datasets & dataloaders.
+    End-to-end helper: build datasets & dataloaders.
+
+    三种模式:
+      1. train_csv + val_csv 都提供  → 各自从 CSV 加载, 不做自动划分
+      2. 只提供 train_csv            → train 从 CSV, val 从 train 里按比例划分
+      3. 都不提供                     → 扫描目录, 按比例划分
 
     Args:
         data_root: Path to BraTS2021 data.
-        csv_path: Path to CSV file (subject_id, score). If None, scan directory.
+        train_csv: Path to training CSV (subject_id, score).
+        val_csv: Path to validation CSV (subject_id, score).
         batch_size: Batch size for training loader.
-        val_ratio: Fraction for validation.
+        val_ratio: Fraction for validation (only used when val_csv is None).
         num_workers: DataLoader workers.
-        max_samples: Limit total samples (for debugging / small-scale experiments).
+        max_samples: Limit total samples per split (for debugging).
         roi_size: Random crop size for training.
-        cache_rate: Fraction of data to cache in memory (0.0 = no cache, 1.0 = full cache).
+        cache_rate: Fraction of data to cache in memory.
         seed: Random seed.
 
     Returns:
         (train_loader, val_loader)
-
-    DataLoader 返回的 batch dict 包含:
-        batch["image"]      : (B, 4, D, H, W) tensor
-        batch["label"]      : (B, 3, D, H, W) tensor  (TC, WT, ET)
-        batch["score"]      : (B,) tensor              ← CSV 得分
-        batch["subject_id"] : list of str              ← subject ID
     """
-    data_list = get_brats_file_list(data_root, csv_path=csv_path, max_samples=max_samples)
-    train_list, val_list = split_dataset(data_list, val_ratio=val_ratio, seed=seed)
+    if train_csv and val_csv:
+        # ── 模式 1: 两个 CSV 分别指定 train / val ────────────
+        train_list = get_brats_file_list(data_root, csv_path=train_csv, max_samples=max_samples)
+        val_list   = get_brats_file_list(data_root, csv_path=val_csv,   max_samples=max_samples)
+        print(f"[Dataset] Train: {len(train_list)}, Val: {len(val_list)} (from separate CSVs)")
+    else:
+        # ── 模式 2/3: 单个来源, 自动划分 ─────────────────────
+        data_list = get_brats_file_list(data_root, csv_path=train_csv, max_samples=max_samples)
+        train_list, val_list = split_dataset(data_list, val_ratio=val_ratio, seed=seed)
 
     train_transforms = get_train_transforms(roi_size=roi_size)
     val_transforms = get_val_transforms()
 
-    # Use CacheDataset for faster training if cache_rate > 0
     if cache_rate > 0:
         train_ds = CacheDataset(data=train_list, transform=train_transforms, cache_rate=cache_rate, num_workers=num_workers)
         val_ds   = CacheDataset(data=val_list,   transform=val_transforms,   cache_rate=cache_rate, num_workers=num_workers)
