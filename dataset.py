@@ -177,6 +177,7 @@ def get_brats_file_list(
 
         if not os.path.isdir(subj_dir):
             missing_count += 1
+            print(f"[Dataset] Warning: {subj_dir} is not found or incomplete on disk")
             continue
 
         t1    = os.path.join(subj_dir, f"{subj_id}_t1.nii.gz")
@@ -198,6 +199,7 @@ def get_brats_file_list(
 
     if missing_count > 0:
         print(f"[Dataset] Warning: {missing_count} subjects not found or incomplete on disk")
+
 
     if max_samples is not None and max_samples > 0:
         data_list = data_list[:max_samples]
@@ -253,7 +255,6 @@ def get_train_transforms(roi_size: Tuple[int, int, int] = (128, 128, 128)) -> Co
         Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
         Orientationd(keys=["image", "label"], axcodes="RAS"),
         NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-        CropForegroundd(keys=["image", "label"], source_key="image"),
         RandCropByPosNegLabeld(
             keys=["image", "label"],
             label_key="label",
