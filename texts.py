@@ -8,7 +8,7 @@ def test_models(device="cpu"):
     test_models() runs a simple test to verify that the models can process a random input tensor and produce an output of the expected shape. It iterates over a list of model names, builds each model, and checks the input and output shapes.
     """
 
-    for name in ["basic_unet", "monai_unet"]:
+    for name in ["basic_unet", "monai_unet", "transunet3d"]:
         print(f"\n{'='*60}")
         model = build_model(name, features=(16, 32, 64, 128)).to(device)
         x = torch.randn(1, 4, 64, 64, 64, device=device)

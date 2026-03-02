@@ -34,6 +34,7 @@ from typing import Tuple, Optional, Dict
 import torch
 import torch.nn as nn
 from monai.networks.nets import UNet, AttentionUnet, UNETR, SwinUNETR
+from transunet3d import TransUNet3D
 
 
 # ═════════════════════════════════════════════════════════════
@@ -345,8 +346,8 @@ class SegWithClassifier(nn.Module):
         self.backbone_name = backbone_name.lower().replace("-", "_")
 
         # ── 根据 backbone 类型选择特征提取策略 ────────────────
-        if self.backbone_name == "basic_unet":
-            # 手写模型: 直接让它返回 features
+        if hasattr(self.backbone, "set_return_features") and hasattr(self.backbone, "bottleneck_channels"):
+            # 手写模型/本地实现模型: 直接让它返回 features
             self.backbone.set_return_features(True)
             bottleneck_ch = self.backbone.bottleneck_channels
             self._use_hook = False
@@ -433,10 +434,18 @@ def _build_backbone(
             dropout_path_rate=0.0, use_checkpoint=True,
         )
 
+    elif name == "transunet3d":
+        return TransUNet3D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            features=features,
+            dropout=dropout,
+        )
+
     else:
         raise ValueError(
             f"Unknown model '{model_name}'. "
-            f"Available: basic_unet, monai_unet, attention_unet, unetr, swin_unetr"
+            f"Available: basic_unet, monai_unet, attention_unet, unetr, swin_unetr, transunet3d"
         )
 
 
@@ -463,6 +472,7 @@ def build_model(
     │  attention_unet  │  MONAI AttentionUnet              │
     │  unetr           │  MONAI UNETR                      │
     │  swin_unetr      │  MONAI SwinUNETR                  │
+    │  transunet3d     │  本地 3D TransUNet (CNN+Transformer)│
     └──────────────────┴────────────────────────────────────┘
 
     Args:
@@ -512,7 +522,7 @@ if __name__ == "__main__":
     print("=" * 70)
     print("  Test 1: 纯分割模式")
     print("=" * 70)
-    for name in ["basic_unet", "monai_unet"]:
+    for name in ["basic_unet", "monai_unet", "transunet3d"]:
         model = build_model(name, features=test_features, with_classifier=False).to(device)
         with torch.no_grad():
             y = model(x)
@@ -523,7 +533,7 @@ if __name__ == "__main__":
     print("=" * 70)
     print("  Test 2: 分割 + 分类 多任务模式")
     print("=" * 70)
-    for name in ["basic_unet", "monai_unet"]:
+    for name in ["basic_unet", "monai_unet", "transunet3d"]:
         model = build_model(name, features=test_features, with_classifier=True, num_classes=1).to(device)
         with torch.no_grad():
             seg, cls = model(x)

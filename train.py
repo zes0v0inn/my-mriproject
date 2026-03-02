@@ -79,8 +79,8 @@ def parse_args():
     # ── Model ─────────────────────────────────────────────────
     model_group = parser.add_argument_group("Model")
     model_group.add_argument("--model", type=str, default="basic_unet",
-                             choices=["basic_unet", "monai_unet", "attention_unet", "unetr", "swin_unetr"],
-                             help="Model architecture: basic_unet(手写) / monai_unet(MONAI内置) / attention_unet / unetr / swin_unetr")
+                             choices=["basic_unet", "monai_unet", "attention_unet", "unetr", "swin_unetr", "transunet3d"],
+                             help="Model architecture: basic_unet(手写) / monai_unet(MONAI内置) / attention_unet / unetr / swin_unetr / transunet3d")
     model_group.add_argument("--in_channels", type=int, default=4,
                              help="Number of input channels (4 for BraTS)")
     model_group.add_argument("--out_channels", type=int, default=3,
